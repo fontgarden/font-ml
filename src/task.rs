@@ -31,6 +31,10 @@ pub enum Task {
     Field,
     /// Train a bolden model from two masters of one family.
     Train,
+    /// Draw a shape from a sentence into a glyph.
+    Draw,
+    /// Train a draw model from the shapes in one UFO.
+    TrainDraw,
 }
 
 impl Task {
@@ -43,6 +47,8 @@ impl Task {
             Task::Kerning => "kerning",
             Task::Field => "field",
             Task::Train => "train",
+            Task::Draw => "draw",
+            Task::TrainDraw => "train-draw",
         }
     }
 
@@ -57,6 +63,8 @@ impl Task {
             Task::Kerning,
             Task::Field,
             Task::Train,
+            Task::Draw,
+            Task::TrainDraw,
         ]
     }
 
@@ -74,6 +82,7 @@ impl Task {
             // Field models are declared in the format only.
             Task::Field => false,
             Task::Train => true,
+            Task::Draw | Task::TrainDraw => true,
         }
     }
 
@@ -87,6 +96,8 @@ impl Task {
             Task::Kerning => &["source", "left", "right"],
             Task::Field => &["glyph"],
             Task::Train => &["source", "target", "out"],
+            Task::Draw => &["source", "model", "glyph", "prompt"],
+            Task::TrainDraw => &["source", "out"],
         }
     }
 }
@@ -195,6 +206,8 @@ impl Task {
             Task::Kerning => "Propose kerning",
             Task::Field => "Distance field",
             Task::Train => "Train bolden",
+            Task::Draw => "Draw from text",
+            Task::TrainDraw => "Train draw",
         }
     }
 
@@ -213,6 +226,16 @@ impl Task {
             Task::Train => {
                 "Train a bolden model from a lighter and a heavier master of one family, \
                  in candle, on this machine. Writes a model directory."
+            }
+            Task::Draw => {
+                "Draw a shape from a sentence, such as \"draw a circle 64 units wide in the \
+                 lower left\", into a glyph as a proposal. The model only knows the shapes \
+                 it was trained on."
+            }
+            Task::TrainDraw => {
+                "Train a draw model from scratch on the shapes in one UFO. Each glyph's name \
+                 is the word for it; widths and positions are augmented. Writes a model \
+                 directory."
             }
         }
     }
@@ -436,6 +459,107 @@ impl Task {
                         ],
                     )
                 }
+                Task::Draw => (
+                    vec![
+                        input("source", Kind::Source, true, None, "The UFO to draw into."),
+                        input(
+                            "model",
+                            Kind::Model,
+                            true,
+                            None,
+                            "The draw model directory.",
+                        ),
+                        input(
+                            "glyph",
+                            Kind::Glyph,
+                            true,
+                            None,
+                            "The glyph to draw into; its advance is the box width.",
+                        ),
+                        input(
+                            "prompt",
+                            Kind::Text,
+                            true,
+                            None,
+                            "What to draw: a shape, a width in units, and where.",
+                        ),
+                        input(
+                            "write",
+                            Kind::Flag,
+                            false,
+                            Some(0.0),
+                            "Write the drawing into the source as a proposal layer.",
+                        ),
+                    ],
+                    vec![
+                        output(
+                            "com.runebender.proposal.draw",
+                            Kind::Layer,
+                            "The drawn glyph, next to the foreground, when --write is given.",
+                        ),
+                        output(
+                            "glyphs",
+                            Kind::Rows,
+                            "Per glyph: points, contours, unknown words.",
+                        ),
+                    ],
+                ),
+                Task::TrainDraw => (
+                    vec![
+                        input(
+                            "source",
+                            Kind::Source,
+                            true,
+                            None,
+                            "The UFO of shapes to learn.",
+                        ),
+                        input(
+                            "out",
+                            Kind::Text,
+                            true,
+                            None,
+                            "The model directory to write.",
+                        ),
+                        input(
+                            "steps",
+                            Kind::Number,
+                            false,
+                            Some(1500.0),
+                            "Optimizer steps.",
+                        ),
+                        input("dims", Kind::Number, false, Some(128.0), "Model width."),
+                        input(
+                            "layers",
+                            Kind::Number,
+                            false,
+                            Some(4.0),
+                            "Transformer blocks.",
+                        ),
+                        input("heads", Kind::Number, false, Some(4.0), "Attention heads."),
+                        input(
+                            "batch",
+                            Kind::Number,
+                            false,
+                            Some(16.0),
+                            "Sequences per step.",
+                        ),
+                        input(
+                            "minutes",
+                            Kind::Number,
+                            false,
+                            Some(0.0),
+                            "Stop after this long; 0 runs every step.",
+                        ),
+                        input(
+                            "lr",
+                            Kind::Number,
+                            false,
+                            Some(0.0003),
+                            "Peak learning rate.",
+                        ),
+                    ],
+                    vec![output("model", Kind::Model, "The model directory written.")],
+                ),
             };
         Spec {
             name: self.as_str().into(),

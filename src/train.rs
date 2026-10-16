@@ -684,7 +684,12 @@ impl Corpus {
 // ---- the loop ----
 
 /// Pads sequences to one width and makes the batch tensor.
-fn pad_batch(seqs: &[Vec<u32>], pad: u32, max_len: usize, device: &Device) -> Result<Tensor> {
+pub(crate) fn pad_batch(
+    seqs: &[Vec<u32>],
+    pad: u32,
+    max_len: usize,
+    device: &Device,
+) -> Result<Tensor> {
     let width = seqs
         .iter()
         .map(|s| s.len().min(max_len))
@@ -701,7 +706,12 @@ fn pad_batch(seqs: &[Vec<u32>], pad: u32, max_len: usize, device: &Device) -> Re
 }
 
 /// Next-token cross entropy over every position that is not padding.
-fn masked_loss(model: &OutlineModel, batch: &Tensor, pad: u32, train: bool) -> Result<Tensor> {
+pub(crate) fn masked_loss(
+    model: &OutlineModel,
+    batch: &Tensor,
+    pad: u32,
+    train: bool,
+) -> Result<Tensor> {
     let (b, l) = batch.dims2()?;
     let inputs = batch.narrow(1, 0, l - 1)?;
     let targets = batch.narrow(1, 1, l - 1)?;
@@ -718,7 +728,7 @@ fn masked_loss(model: &OutlineModel, batch: &Tensor, pad: u32, train: bool) -> R
 }
 
 /// The learning rate at a step: linear warmup, then cosine to zero.
-fn lr_at(step: usize, cfg: &TrainConfig) -> f64 {
+pub(crate) fn lr_at(step: usize, cfg: &TrainConfig) -> f64 {
     if step <= cfg.warmup {
         cfg.lr * step as f64 / cfg.warmup.max(1) as f64
     } else {
@@ -729,7 +739,7 @@ fn lr_at(step: usize, cfg: &TrainConfig) -> f64 {
 }
 
 /// Today as `YYYY-MM-DD`, from the system clock.
-fn today() -> String {
+pub(crate) fn today() -> String {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -1010,7 +1020,7 @@ pub fn train(
 }
 
 /// `vocab.txt` as `Checkpoint::open` reads it: names, then `#U` lines.
-fn write_vocab(out: &Path, vocab: &Vocab) -> Result<()> {
+pub(crate) fn write_vocab(out: &Path, vocab: &Vocab) -> Result<()> {
     let mut text = String::new();
     for name in vocab.glyph_names() {
         text.push_str(name);
@@ -1023,7 +1033,7 @@ fn write_vocab(out: &Path, vocab: &Vocab) -> Result<()> {
     std::fs::write(&path, text).map_err(|source| Error::Io { path, source })
 }
 
-fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+pub(crate) fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     let text = serde_json::to_string_pretty(value).map_err(|e| Error::Io {
         path: path.to_path_buf(),
         source: std::io::Error::other(e.to_string()),

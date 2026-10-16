@@ -162,6 +162,9 @@ enum Command {
         /// Every drawn glyph in the source.
         #[arg(long)]
         all: bool,
+        /// draw: what to draw, such as "a circle 64 units wide in the center".
+        #[arg(long)]
+        prompt: Option<String>,
         /// Scale the predicted offsets. Above 1 boldens harder.
         #[arg(long, default_value = "1.0")]
         strength: f64,
@@ -349,10 +352,42 @@ fn main() -> ExitCode {
         ),
         Command::Run {
             task,
+            source,
+            quiet,
+            out,
+            steps,
+            dims,
+            layers,
+            heads,
+            batch,
+            minutes,
+            lr,
+            device,
+            ..
+        } if task == "train-draw" => train_draw_cmd(
+            source.as_deref(),
+            out.as_deref(),
+            font_ml::train::TrainConfig {
+                steps,
+                minutes,
+                batch,
+                dims,
+                layers,
+                heads,
+                lr,
+                device,
+                ..Default::default()
+            },
+            quiet,
+            cli.json,
+        ),
+        Command::Run {
+            task,
             model,
             source,
             glyph,
             all,
+            prompt,
             strength,
             reference,
             write,
@@ -366,6 +401,7 @@ fn main() -> ExitCode {
             source.as_deref(),
             RunOptions {
                 glyphs: glyph,
+                prompt,
                 all,
                 strength,
                 reference,
@@ -501,6 +537,7 @@ fn tasks(json: bool) {
 /// What a `run` was asked to do beyond the task and the model.
 struct RunOptions {
     glyphs: Vec<String>,
+    prompt: Option<String>,
     all: bool,
     strength: f64,
     reference: Option<PathBuf>,
@@ -573,6 +610,7 @@ fn run(
     }
     match task {
         Task::Bolden => bolden(&checkpoint, source, &options, json),
+        Task::Draw => draw(&checkpoint, source, &options, json),
         _ => fail(json, exit::FAILED, "a ready task with no runner"),
     }
 }
@@ -736,6 +774,167 @@ fn chat(
 /// `run train`: two masters in, a model directory out. Progress lines
 /// carry the step and the loss; the JSON report carries the rest.
 #[allow(clippy::too_many_arguments)]
+fn train_draw_cmd(
+    source: Option<&std::path::Path>,
+    out: Option<&std::path::Path>,
+    cfg: font_ml::train::TrainConfig,
+    quiet: bool,
+    json: bool,
+) -> u8 {
+    let (Some(source), Some(out)) = (source, out) else {
+        return fail(
+            json,
+            exit::USAGE,
+            "train-draw needs --source (the UFO of shapes) and --out",
+        );
+    };
+    let mut on_progress = |step: usize, steps: usize, note: &str| {
+        if !quiet {
+            eprintln!("progress {step}/{steps} {note}");
+        }
+    };
+    match font_ml::draw::train_draw(source, out, &cfg, &mut on_progress) {
+        Ok(report) => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "ok": true,
+                        "model": report.out,
+                        "steps": report.steps,
+                        "best_val_loss": report.best_val,
+                        "init_loss": report.init_loss,
+                        "params": report.params,
+                        "seconds": report.seconds,
+                        "vocab": report.vocab,
+                        "shapes": report.train_glyphs,
+                        "val_sequences": report.val_sequences,
+                        "device": report.device,
+                    })
+                );
+            } else {
+                println!(
+                    "{}: {} steps, best val loss {:.4}, {} shapes, {:.1}M params, {:.0}s",
+                    report.out.display(),
+                    report.steps,
+                    report.best_val,
+                    report.train_glyphs,
+                    report.params as f64 / 1e6,
+                    report.seconds
+                );
+            }
+            exit::OK
+        }
+        Err(e) => fail(json, exit::FAILED, &e.to_string()),
+    }
+}
+
+/// `draw`: a shape from a sentence into one glyph.
+fn draw(
+    checkpoint: &Checkpoint,
+    source: Option<&std::path::Path>,
+    options: &RunOptions,
+    json: bool,
+) -> u8 {
+    let Some(source) = source else {
+        return fail(json, exit::USAGE, "draw needs --source");
+    };
+    let Some(prompt) = options.prompt.as_deref() else {
+        return fail(json, exit::USAGE, "draw needs --prompt");
+    };
+    let Some(name) = options.glyphs.first() else {
+        return fail(
+            json,
+            exit::USAGE,
+            "draw needs --glyph, the glyph to draw into",
+        );
+    };
+    if checkpoint.config.extra.get("task").and_then(|v| v.as_str()) != Some("draw") {
+        return fail(
+            json,
+            exit::USAGE,
+            "this model was not trained by train-draw",
+        );
+    }
+    let device = match pick_device(&options.device) {
+        Ok(d) => d,
+        Err(e) => return fail(json, exit::USAGE, &e),
+    };
+    let device_name = font_ml::device::name(&device);
+    let model = match font_ml::outline::OutlineModel::load_on(checkpoint, device) {
+        Ok(m) => m,
+        Err(e) => return fail(json, exit::FAILED, &e.to_string()),
+    };
+    let mut font = match norad::Font::load(source) {
+        Ok(f) => f,
+        Err(e) => return fail(json, exit::USAGE, &format!("{source:?}: {e}")),
+    };
+    let Some(target) = font.default_layer().get_glyph(name.as_str()).cloned() else {
+        return fail(json, exit::USAGE, &format!("no glyph {name} in {source:?}"));
+    };
+    let drawn = match font_ml::draw::draw(&model, prompt, target.width, checkpoint.config.max_len) {
+        Ok(d) => d,
+        Err(e) => return fail(json, exit::FAILED, &e.to_string()),
+    };
+    let contours = font_ml::draw::ops_to_contours(&drawn.ops);
+    if contours.is_empty() {
+        return fail(json, exit::FAILED, "the model drew nothing well formed");
+    }
+    let points: usize = contours.iter().map(|c| c.points.len()).sum();
+    let layer = if options.write {
+        let mut glyph = target.clone();
+        glyph.contours = contours.clone();
+        glyph.components.clear();
+        match font_ml::ufo::write_proposal(&mut font, "draw", [glyph]) {
+            Ok(l) => {
+                if let Err(e) = font.save(source) {
+                    return fail(json, exit::FAILED, &format!("{source:?}: {e}"));
+                }
+                Some(l)
+            }
+            Err(e) => return fail(json, exit::FAILED, &format!("proposal layer: {e}")),
+        }
+    } else {
+        None
+    };
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "ok": true,
+                "task": "draw",
+                "glyph": name,
+                "prompt": prompt,
+                "advance": target.width,
+                "contours": contours.len(),
+                "points": points,
+                "tokens": drawn.tokens,
+                "ended": drawn.ended,
+                "unknown_words": drawn.unknown,
+                "device": device_name,
+                "glyphs": [{"glyph": name, "contours": contours.len(), "points": points}],
+                "proposal": layer.as_ref().map(|l| serde_json::json!({
+                    "layer": l, "glyphs": 1, "source": source,
+                })),
+            })
+        );
+    } else {
+        println!(
+            "{name}: {} contour(s), {points} points{}{}",
+            contours.len(),
+            if drawn.unknown.is_empty() {
+                String::new()
+            } else {
+                format!(", unknown words: {}", drawn.unknown.join(" "))
+            },
+            layer
+                .map(|l| format!(", written to {l}"))
+                .unwrap_or_default()
+        );
+    }
+    exit::OK
+}
+
 fn train_cmd(
     source: Option<&std::path::Path>,
     target: Option<&std::path::Path>,
