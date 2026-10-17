@@ -44,6 +44,9 @@ struct Cli {
     command: Command,
 }
 
+// `Run` carries every task's flags; the others are small. A CLI enum
+// is built once, so the size difference costs nothing.
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 enum Command {
     /// List the model directories under a path.
@@ -168,6 +171,10 @@ enum Command {
         /// draw: the box the shape fills, as `x,y,w,h` in font units.
         #[arg(long = "box")]
         box_: Option<String>,
+        /// draw: 0 takes the most likely drawing every time; another
+        /// number samples a different drawing for each seed.
+        #[arg(long, default_value = "0")]
+        seed: u64,
         /// train-draw: more UFOs to learn from. Repeat for several.
         #[arg(long)]
         also: Vec<PathBuf>,
@@ -411,6 +418,7 @@ fn main() -> ExitCode {
             all,
             prompt,
             box_,
+            seed,
             strength,
             reference,
             write,
@@ -426,6 +434,7 @@ fn main() -> ExitCode {
                 glyphs: glyph,
                 prompt,
                 box_,
+                seed,
                 all,
                 strength,
                 reference,
@@ -563,6 +572,7 @@ struct RunOptions {
     glyphs: Vec<String>,
     prompt: Option<String>,
     box_: Option<String>,
+    seed: u64,
     all: bool,
     strength: f64,
     reference: Option<PathBuf>,
@@ -858,16 +868,15 @@ fn train_draw_cmd(
     }
 }
 
-/// `draw`: a shape from a sentence into one glyph.
+/// `draw`: a shape from a word into a box. With --write it lands in
+/// a glyph of the source as a proposal; without, the contours come
+/// back in the report and nothing is read or written.
 fn draw(
     checkpoint: &Checkpoint,
     source: Option<&std::path::Path>,
     options: &RunOptions,
     json: bool,
 ) -> u8 {
-    let Some(source) = source else {
-        return fail(json, exit::USAGE, "draw needs --source");
-    };
     let Some(prompt) = options.prompt.as_deref() else {
         return fail(json, exit::USAGE, "draw needs --prompt");
     };
@@ -879,21 +888,28 @@ fn draw(
                 json,
                 exit::USAGE,
                 "draw needs --box x,y,w,h, the box the shape fills",
-            )
+            );
         }
     };
-    let Some(name) = options.glyphs.first() else {
+    if checkpoint.config.extra.get("task").and_then(|v| v.as_str()) != Some("draw")
+        || checkpoint
+            .config
+            .extra
+            .get("format")
+            .and_then(|v| v.as_str())
+            != Some("box")
+    {
         return fail(
             json,
             exit::USAGE,
-            "draw needs --glyph, the glyph to draw into",
+            "this model was not trained by train-draw with the box format",
         );
-    };
-    if checkpoint.config.extra.get("task").and_then(|v| v.as_str()) != Some("draw") {
+    }
+    if options.write && (source.is_none() || options.glyphs.is_empty()) {
         return fail(
             json,
             exit::USAGE,
-            "this model was not trained by train-draw",
+            "draw --write needs --source and --glyph, the glyph to draw into",
         );
     }
     let device = match pick_device(&options.device) {
@@ -905,14 +921,13 @@ fn draw(
         Ok(m) => m,
         Err(e) => return fail(json, exit::FAILED, &e.to_string()),
     };
-    let mut font = match norad::Font::load(source) {
-        Ok(f) => f,
-        Err(e) => return fail(json, exit::USAGE, &format!("{source:?}: {e}")),
-    };
-    let Some(target) = font.default_layer().get_glyph(name.as_str()).cloned() else {
-        return fail(json, exit::USAGE, &format!("no glyph {name} in {source:?}"));
-    };
-    let drawn = match font_ml::draw::draw(&model, prompt, b, checkpoint.config.max_len) {
+    let drawn = match font_ml::draw::draw_seeded(
+        &model,
+        prompt,
+        b,
+        checkpoint.config.max_len,
+        options.seed,
+    ) {
         Ok(d) => d,
         Err(e) => return fail(json, exit::FAILED, &e.to_string()),
     };
@@ -921,7 +936,18 @@ fn draw(
         return fail(json, exit::FAILED, "the model drew nothing well formed");
     }
     let points: usize = contours.iter().map(|c| c.points.len()).sum();
+    let name = options.glyphs.first().cloned();
     let layer = if options.write {
+        let (Some(source), Some(name)) = (source, name.as_deref()) else {
+            return fail(json, exit::USAGE, "draw --write needs --source and --glyph");
+        };
+        let mut font = match norad::Font::load(source) {
+            Ok(f) => f,
+            Err(e) => return fail(json, exit::USAGE, &format!("{source:?}: {e}")),
+        };
+        let Some(target) = font.default_layer().get_glyph(name).cloned() else {
+            return fail(json, exit::USAGE, &format!("no glyph {name} in {source:?}"));
+        };
         let mut glyph = target.clone();
         glyph.contours = contours.clone();
         glyph.components.clear();
@@ -938,6 +964,29 @@ fn draw(
         None
     };
     if json {
+        let contour_json: Vec<serde_json::Value> = contours
+            .iter()
+            .map(|c| {
+                serde_json::json!(c
+                    .points
+                    .iter()
+                    .map(|p| {
+                        serde_json::json!({
+                            "x": p.x,
+                            "y": p.y,
+                            "type": match p.typ {
+                                norad::PointType::Move => "move",
+                                norad::PointType::Line => "line",
+                                norad::PointType::OffCurve => "offcurve",
+                                norad::PointType::Curve => "curve",
+                                norad::PointType::QCurve => "qcurve",
+                            },
+                            "smooth": p.smooth,
+                        })
+                    })
+                    .collect::<Vec<_>>())
+            })
+            .collect();
         println!(
             "{}",
             serde_json::json!({
@@ -946,7 +995,9 @@ fn draw(
                 "glyph": name,
                 "prompt": prompt,
                 "box": [b.x, b.y, b.w, b.h],
-                "contours": contours.len(),
+                "seed": options.seed,
+                "contours": contour_json,
+                "path": font_ml::draw::svg_path(&drawn.ops),
                 "points": points,
                 "tokens": drawn.tokens,
                 "ended": drawn.ended,
@@ -960,7 +1011,8 @@ fn draw(
         );
     } else {
         println!(
-            "{name}: {} contour(s), {points} points{}{}",
+            "{}: {} contour(s), {points} points{}{}",
+            name.as_deref().unwrap_or(prompt),
             contours.len(),
             if drawn.unknown.is_empty() {
                 String::new()

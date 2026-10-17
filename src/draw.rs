@@ -611,8 +611,22 @@ pub struct Drawn {
     pub ended: bool,
 }
 
-/// Draws what `prompt` names, filling `b`.
+/// Draws what `prompt` names, filling `b`, taking the most likely
+/// token every time.
 pub fn draw(model: &OutlineModel, prompt: &str, b: Box, max_len: usize) -> Result<Drawn> {
+    draw_seeded(model, prompt, b, max_len, 0)
+}
+
+/// Like [`draw`]; a `seed` other than 0 samples among the likely
+/// tokens instead, so different seeds give different drawings of the
+/// same word. That is what a tool's "another option" does.
+pub fn draw_seeded(
+    model: &OutlineModel,
+    prompt: &str,
+    b: Box,
+    max_len: usize,
+    seed: u64,
+) -> Result<Drawn> {
     let v = model.vocab();
     let eos = v.special("EOS").unwrap_or(2) as u32;
     let b = Box {
@@ -624,8 +638,13 @@ pub fn draw(model: &OutlineModel, prompt: &str, b: Box, max_len: usize) -> Resul
     let (mut ids, unknown) = encode_prompt(v, prompt, b);
     let header = ids.len();
     let mut ended = false;
+    let mut rng = Rng::new(seed.wrapping_mul(7919).wrapping_add(17));
     while ids.len() < max_len {
-        let next = model.next_token(&ids)?;
+        let next = if seed == 0 {
+            model.next_token(&ids)?
+        } else {
+            sample_token(model, &ids, &mut rng)?
+        };
         ids.push(next);
         if next == eos {
             ended = true;
@@ -639,6 +658,33 @@ pub fn draw(model: &OutlineModel, prompt: &str, b: Box, max_len: usize) -> Resul
         tokens: body.len(),
         ended,
     })
+}
+
+/// A token drawn from the eight likeliest, with their probabilities
+/// sharpened a little. Enough variety to offer another option, not so
+/// much that a square comes out with five corners.
+fn sample_token(model: &OutlineModel, ids: &[u32], rng: &mut Rng) -> Result<u32> {
+    use candle_core::IndexOp;
+    let logits = model.forward(ids)?;
+    let last = logits.i(logits.dim(0)? - 1)?.to_vec1::<f32>()?;
+    let mut top: Vec<(usize, f32)> = last.iter().copied().enumerate().collect();
+    top.sort_by(|a, b| b.1.total_cmp(&a.1));
+    top.truncate(8);
+    let temperature = 0.7f32;
+    let max = top[0].1;
+    let weights: Vec<f32> = top
+        .iter()
+        .map(|(_, l)| ((l - max) / temperature).exp())
+        .collect();
+    let total: f32 = weights.iter().sum();
+    let mut pick = rng.f64() as f32 * total;
+    for ((id, _), w) in top.iter().zip(&weights) {
+        if pick <= *w {
+            return Ok(*id as u32);
+        }
+        pick -= w;
+    }
+    Ok(top[0].0 as u32)
 }
 
 /// Drawing commands as UFO contours. A contour that returns to its
