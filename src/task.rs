@@ -96,7 +96,7 @@ impl Task {
             Task::Kerning => &["source", "left", "right"],
             Task::Field => &["glyph"],
             Task::Train => &["source", "target", "out"],
-            Task::Draw => &["source", "model", "glyph", "prompt"],
+            Task::Draw => &["source", "model", "glyph", "prompt", "box"],
             Task::TrainDraw => &["source", "out"],
         }
     }
@@ -228,9 +228,8 @@ impl Task {
                  in candle, on this machine. Writes a model directory."
             }
             Task::Draw => {
-                "Draw a shape from a sentence, such as \"draw a circle 64 units wide in the \
-                 lower left\", into a glyph as a proposal. The model only knows the shapes \
-                 it was trained on."
+                "Draw a shape from a word, such as \"star\", into a box in a glyph, as a \
+                 proposal. The model only knows the words it was trained on."
             }
             Task::TrainDraw => {
                 "Train a draw model from scratch on the shapes in one UFO. Each glyph's name \
@@ -481,7 +480,14 @@ impl Task {
                             Kind::Text,
                             true,
                             None,
-                            "What to draw: a shape, a width in units, and where.",
+                            "The word for the shape, such as star.",
+                        ),
+                        input(
+                            "box",
+                            Kind::Text,
+                            true,
+                            None,
+                            "The box the shape fills: x,y,w,h in font units.",
                         ),
                         input(
                             "write",
@@ -514,6 +520,13 @@ impl Task {
                             "The UFO of shapes to learn.",
                         ),
                         input(
+                            "also",
+                            Kind::Text,
+                            false,
+                            None,
+                            "More UFOs to learn from, comma separated.",
+                        ),
+                        input(
                             "out",
                             Kind::Text,
                             true,
@@ -521,21 +534,42 @@ impl Task {
                             "The model directory to write.",
                         ),
                         input(
+                            "init",
+                            Kind::Model,
+                            false,
+                            None,
+                            "Continue from this model; new words take its spare slots.",
+                        ),
+                        input(
+                            "spare",
+                            Kind::Number,
+                            false,
+                            Some(16.0),
+                            "Spare word slots a fresh base keeps.",
+                        ),
+                        input(
+                            "sample_words",
+                            Kind::Text,
+                            false,
+                            None,
+                            "Words to draw at every checkpoint, comma separated.",
+                        ),
+                        input(
                             "steps",
                             Kind::Number,
                             false,
-                            Some(1500.0),
+                            Some(6000.0),
                             "Optimizer steps.",
                         ),
-                        input("dims", Kind::Number, false, Some(128.0), "Model width."),
+                        input("dims", Kind::Number, false, Some(256.0), "Model width."),
                         input(
                             "layers",
                             Kind::Number,
                             false,
-                            Some(4.0),
+                            Some(6.0),
                             "Transformer blocks.",
                         ),
-                        input("heads", Kind::Number, false, Some(4.0), "Attention heads."),
+                        input("heads", Kind::Number, false, Some(8.0), "Attention heads."),
                         input(
                             "batch",
                             Kind::Number,

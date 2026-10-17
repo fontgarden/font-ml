@@ -162,9 +162,21 @@ enum Command {
         /// Every drawn glyph in the source.
         #[arg(long)]
         all: bool,
-        /// draw: what to draw, such as "a circle 64 units wide in the center".
+        /// draw: the word for the shape, such as "star".
         #[arg(long)]
         prompt: Option<String>,
+        /// draw: the box the shape fills, as `x,y,w,h` in font units.
+        #[arg(long = "box")]
+        box_: Option<String>,
+        /// train-draw: more UFOs to learn from. Repeat for several.
+        #[arg(long)]
+        also: Vec<PathBuf>,
+        /// train-draw: spare word slots a fresh base keeps for words learned later.
+        #[arg(long, default_value = "16")]
+        spare: usize,
+        /// train-draw: words to draw at every checkpoint, printed as `sample` lines.
+        #[arg(long, value_delimiter = ',')]
+        sample_words: Vec<String>,
         /// Scale the predicted offsets. Above 1 boldens harder.
         #[arg(long, default_value = "1.0")]
         strength: f64,
@@ -353,8 +365,12 @@ fn main() -> ExitCode {
         Command::Run {
             task,
             source,
+            also,
             quiet,
             out,
+            init,
+            spare,
+            sample_words,
             steps,
             dims,
             layers,
@@ -366,6 +382,7 @@ fn main() -> ExitCode {
             ..
         } if task == "train-draw" => train_draw_cmd(
             source.as_deref(),
+            &also,
             out.as_deref(),
             font_ml::train::TrainConfig {
                 steps,
@@ -378,6 +395,11 @@ fn main() -> ExitCode {
                 device,
                 ..Default::default()
             },
+            font_ml::draw::DrawOptions {
+                init,
+                spare,
+                sample_words,
+            },
             quiet,
             cli.json,
         ),
@@ -388,6 +410,7 @@ fn main() -> ExitCode {
             glyph,
             all,
             prompt,
+            box_,
             strength,
             reference,
             write,
@@ -402,6 +425,7 @@ fn main() -> ExitCode {
             RunOptions {
                 glyphs: glyph,
                 prompt,
+                box_,
                 all,
                 strength,
                 reference,
@@ -538,6 +562,7 @@ fn tasks(json: bool) {
 struct RunOptions {
     glyphs: Vec<String>,
     prompt: Option<String>,
+    box_: Option<String>,
     all: bool,
     strength: f64,
     reference: Option<PathBuf>,
@@ -776,8 +801,10 @@ fn chat(
 #[allow(clippy::too_many_arguments)]
 fn train_draw_cmd(
     source: Option<&std::path::Path>,
+    also: &[PathBuf],
     out: Option<&std::path::Path>,
     cfg: font_ml::train::TrainConfig,
+    opts: font_ml::draw::DrawOptions,
     quiet: bool,
     json: bool,
 ) -> u8 {
@@ -788,12 +815,14 @@ fn train_draw_cmd(
             "train-draw needs --source (the UFO of shapes) and --out",
         );
     };
+    let mut sources = vec![source.to_path_buf()];
+    sources.extend(also.iter().cloned());
     let mut on_progress = |step: usize, steps: usize, note: &str| {
         if !quiet {
             eprintln!("progress {step}/{steps} {note}");
         }
     };
-    match font_ml::draw::train_draw(source, out, &cfg, &mut on_progress) {
+    match font_ml::draw::train_draw(&sources, out, &cfg, &opts, &mut on_progress) {
         Ok(report) => {
             if json {
                 println!(
@@ -842,6 +871,17 @@ fn draw(
     let Some(prompt) = options.prompt.as_deref() else {
         return fail(json, exit::USAGE, "draw needs --prompt");
     };
+    let b = match options.box_.as_deref().map(font_ml::draw::Box::parse) {
+        Some(Ok(b)) => b,
+        Some(Err(e)) => return fail(json, exit::USAGE, &e),
+        None => {
+            return fail(
+                json,
+                exit::USAGE,
+                "draw needs --box x,y,w,h, the box the shape fills",
+            )
+        }
+    };
     let Some(name) = options.glyphs.first() else {
         return fail(
             json,
@@ -872,7 +912,7 @@ fn draw(
     let Some(target) = font.default_layer().get_glyph(name.as_str()).cloned() else {
         return fail(json, exit::USAGE, &format!("no glyph {name} in {source:?}"));
     };
-    let drawn = match font_ml::draw::draw(&model, prompt, target.width, checkpoint.config.max_len) {
+    let drawn = match font_ml::draw::draw(&model, prompt, b, checkpoint.config.max_len) {
         Ok(d) => d,
         Err(e) => return fail(json, exit::FAILED, &e.to_string()),
     };
@@ -905,7 +945,7 @@ fn draw(
                 "task": "draw",
                 "glyph": name,
                 "prompt": prompt,
-                "advance": target.width,
+                "box": [b.x, b.y, b.w, b.h],
                 "contours": contours.len(),
                 "points": points,
                 "tokens": drawn.tokens,

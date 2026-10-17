@@ -1,95 +1,50 @@
-//! Draw a shape from a sentence.
+//! Draw a shape from a word into a box.
 //!
-//! A `draw` model is trained from scratch on one UFO. Every drawn
-//! glyph is a shape; its name is the word for it. The trainer measures
-//! each shape, scales it to many widths, puts it at many places in a
-//! box, and writes a sentence for each one from a few templates:
-//! "draw a circle 64 units wide in the lower left". The model then
-//! learns that tiny language and the outlines that go with it.
+//! A `draw` model is trained from scratch on one or more UFOs. Every
+//! drawn glyph is a shape; its name is the word for it. The trainer
+//! measures each shape, then places it in boxes of many sizes and
+//! positions, so the model learns the word and the box together.
 //!
-//! A sequence is `BOS <words> SEP ADV <advance> <ops> EOS`. The words
-//! are ordinary name tokens, so the token table needs nothing new;
-//! numbers are words too, one per width the trainer can produce.
+//! A sequence is `BOS <words> SEP ADV <x> <y> <w> <h> <ops> EOS`: the
+//! words, then the box the drawing fills, then the drawing. The words
+//! are ordinary name tokens, so the token table needs nothing new; the
+//! `ADV` token is borrowed to introduce the four box coordinates.
 //!
-//! At run time the sentence is split into words, unknown words become
-//! `UNK`, the advance of the target glyph goes in the header, and the
-//! model continues greedily until `EOS`.
+//! A base is trained with spare word slots. A later run can continue
+//! from it with new shapes: each new word takes a slot, the slot is
+//! renamed in `vocab.txt`, and every other token keeps its place. That
+//! is how a font adds its own shapes to the tool in minutes rather
+//! than training from nothing.
+//!
+//! At run time the tool sends the word and the box. The model
+//! continues greedily until `EOS`, and the drawing lands in the glyph.
 
-use crate::checkpoint::{ModelConfig, ModelKind};
+use crate::checkpoint::{Checkpoint, ModelConfig, ModelKind};
 use crate::error::{Error, Result};
 use crate::outline::OutlineModel;
-use crate::tokenizer::{snap, Op, Vocab, GRID};
+use crate::tokenizer::{snap, Op, Vocab, COORD_MAX, COORD_MIN};
 use crate::train::{
     load_master, lr_at, pad_batch, today, write_json, write_vocab, Report, Rng, TrainConfig,
 };
-use candle_core::DType;
+use candle_core::{DType, Tensor, D};
 use candle_nn::{Optimizer, VarBuilder, VarMap};
 use std::collections::BTreeSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-/// Space between a shape and the side of its box when it sits left or right.
-pub const SIDEBEARING: f64 = 60.0;
-/// The height of the box a shape is placed in: the cap height.
-pub const BOX_HEIGHT: f64 = 700.0;
-/// The narrowest width the trainer produces.
+/// The narrowest box the trainer produces.
 pub const WIDTH_MIN: i32 = 24;
-/// The widest width the trainer produces.
+/// The widest box the trainer produces.
 pub const WIDTH_MAX: i32 = 720;
-/// Widths come in steps of this many units, so every width is one word.
-pub const WIDTH_STEP: i32 = 8;
 /// How many fixed sequences the validation loss is taken over.
 pub const VAL_SEQUENCES: usize = 48;
-
-/// Where a shape sits in its box, and the phrases for it. The first
-/// entry is the default: a sentence with no position means bottom left,
-/// which is where a drawn glyph sits anyway.
-pub const POSITIONS: &[(&str, &[&str])] = &[
-    (
-        "bottom-left",
-        &["", "in the lower left", "at the bottom left", "bottom left"],
-    ),
-    (
-        "bottom-center",
-        &["at the bottom", "bottom center", "at the bottom, centered"],
-    ),
-    (
-        "bottom-right",
-        &["in the lower right", "at the bottom right", "bottom right"],
-    ),
-    (
-        "middle-left",
-        &["on the left", "middle left", "on the left, centered"],
-    ),
-    ("center", &["in the center", "centered", "in the middle"]),
-    (
-        "middle-right",
-        &["on the right", "middle right", "on the right, centered"],
-    ),
-    (
-        "top-left",
-        &["in the upper left", "at the top left", "top left"],
-    ),
-    (
-        "top-center",
-        &["at the top", "top center", "at the top, centered"],
-    ),
-    (
-        "top-right",
-        &["in the upper right", "at the top right", "top right"],
-    ),
-];
-
-/// The sentence shapes a model learns. `{name}`, `{w}` and `{pos}` are
-/// filled in; a trailing empty `{pos}` leaves no trace.
-pub const TEMPLATES: &[&str] = &[
-    "draw a {name} {w} units wide {pos}",
-    "a {name} {w} wide {pos}",
-    "{name} {w} {pos}",
-    "draw a {w} unit wide {name} {pos}",
-    "make a {name} that is {w} units wide {pos}",
-    "{name}, width {w}, {pos}",
-];
+/// Spare word slots a fresh base keeps for words learned later.
+pub const DEFAULT_SPARE: usize = 16;
+/// A slot's name starts with this. `words` strips it, so no typed
+/// sentence can ever name a slot.
+pub const SLOT_PREFIX: &str = "~";
+/// Words the sentence templates use besides the shape words.
+pub const TEMPLATE_WORDS: &[&str] = &["a", "an", "the", "draw", "make"];
 
 /// The words of a sentence: lower case, letters and digits only.
 pub fn words(text: &str) -> Vec<String> {
@@ -101,17 +56,43 @@ pub fn words(text: &str) -> Vec<String> {
 }
 
 /// The word for a glyph: the name before any `.suffix`, with `-` and
-/// `_` as spaces. `circle.300` and `circle` are both "circle";
+/// `_` as spaces. `circle.big` and `circle` are both "circle";
 /// `five-star` is "five star".
 pub fn shape_words(glyph_name: &str) -> Vec<String> {
     let base = glyph_name.split('.').next().unwrap_or(glyph_name);
     words(&base.replace(['-', '_'], " "))
 }
 
-/// A width the trainer could have produced: the nearest step in range.
-pub fn snap_width(w: f64) -> i32 {
-    let q = (w / WIDTH_STEP as f64).round() as i32 * WIDTH_STEP;
-    q.clamp(WIDTH_MIN, WIDTH_MAX)
+/// A box in font units: the left, the bottom, the width, the height.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Box {
+    pub x: f64,
+    pub y: f64,
+    pub w: f64,
+    pub h: f64,
+}
+
+impl Box {
+    /// Parses `x,y,w,h`.
+    pub fn parse(text: &str) -> std::result::Result<Self, String> {
+        let parts: Vec<f64> = text
+            .split(',')
+            .map(|p| p.trim().parse::<f64>())
+            .collect::<std::result::Result<_, _>>()
+            .map_err(|e| format!("box: {e}"))?;
+        if parts.len() != 4 {
+            return Err("box needs four numbers: x,y,w,h".into());
+        }
+        if parts[2] < 2.0 || parts[3] < 2.0 {
+            return Err("box: width and height must be at least 2 units".into());
+        }
+        Ok(Self {
+            x: parts[0],
+            y: parts[1],
+            w: parts[2],
+            h: parts[3],
+        })
+    }
 }
 
 /// One drawn shape, moved so its box starts at the origin.
@@ -150,7 +131,7 @@ fn map_ops(ops: &[Op], f: impl Fn((f64, f64)) -> (f64, f64)) -> Vec<Op> {
 }
 
 impl Shape {
-    fn new(glyph: &str, ops: &[Op]) -> Option<Self> {
+    pub fn new(glyph: &str, ops: &[Op]) -> Option<Self> {
         let pts: Vec<(f64, f64)> = ops.iter().flat_map(op_points).collect();
         if pts.is_empty() {
             return None;
@@ -167,79 +148,91 @@ impl Shape {
         if width < 1.0 || height < 1.0 {
             return None;
         }
+        let words = shape_words(glyph);
+        if words.is_empty() {
+            return None;
+        }
         Some(Self {
             glyph: glyph.to_string(),
-            words: shape_words(glyph),
+            words,
             ops: map_ops(ops, |(x, y)| (x - x0, y - y0)),
             width,
             height,
         })
     }
 
-    /// The shape scaled to `width` units wide and placed at `(x, y)`,
-    /// every point snapped to the grid.
-    pub fn placed(&self, width: f64, x: f64, y: f64) -> Vec<Op> {
-        let s = width / self.width;
+    /// The shape fitted to a box, every point snapped to the grid.
+    pub fn placed(&self, b: Box) -> Vec<Op> {
+        let sx = b.w / self.width;
+        let sy = b.h / self.height;
         map_ops(&self.ops, |(px, py)| {
-            (f64::from(snap(px * s + x)), f64::from(snap(py * s + y)))
+            (
+                f64::from(snap(px * sx + b.x)),
+                f64::from(snap(py * sy + b.y)),
+            )
         })
     }
 }
 
-/// Where a shape of `w` by `h` goes for a position index, in a box
-/// `advance` wide and [`BOX_HEIGHT`] tall.
-pub fn place(position: usize, w: f64, h: f64, advance: f64) -> (f64, f64) {
-    let x = match position % 3 {
-        0 => SIDEBEARING,
-        1 => (advance - w) / 2.0,
-        _ => advance - SIDEBEARING - w,
-    };
-    let y = match position / 3 {
-        0 => 0.0,
-        1 => (BOX_HEIGHT - h) / 2.0,
-        _ => BOX_HEIGHT - h,
-    };
-    (x, y)
-}
-
-/// Every word a draw model can read.
-pub fn vocabulary(shapes: &[Shape]) -> Vec<String> {
-    let mut set: BTreeSet<String> = BTreeSet::new();
-    for t in TEMPLATES {
-        set.extend(words(&t.replace(['{', '}'], " ")));
-    }
-    for (_, phrases) in POSITIONS {
-        for p in *phrases {
-            set.extend(words(p));
+/// Every word a fresh draw model can read: the template words, the
+/// shape words, then `spare` empty slots.
+pub fn vocabulary(shapes: &[Shape], spare: usize) -> Vec<String> {
+    let mut names: Vec<String> = TEMPLATE_WORDS.iter().map(|w| (*w).to_string()).collect();
+    let mut seen: BTreeSet<String> = names.iter().cloned().collect();
+    let mut shape_words: Vec<String> = shapes.iter().flat_map(|s| s.words.clone()).collect();
+    shape_words.sort();
+    for w in shape_words {
+        if seen.insert(w.clone()) {
+            names.push(w);
         }
     }
-    for s in shapes {
-        set.extend(s.words.iter().cloned());
+    for i in 0..spare {
+        names.push(format!("{SLOT_PREFIX}{i}"));
     }
-    let mut w = WIDTH_MIN;
-    while w <= WIDTH_MAX {
-        set.insert(w.to_string());
-        w += WIDTH_STEP;
-    }
-    // Placeholders are not words.
-    for ph in ["name", "w", "pos"] {
-        set.remove(ph);
-    }
-    set.into_iter().collect()
+    names
 }
 
-/// The header of a sequence: the sentence, then the advance.
-pub fn encode_prompt(v: &Vocab, text: &str, advance: f64) -> (Vec<u32>, Vec<String>) {
+/// The words a model knows, without its spare slots.
+pub fn known_words(names: &[String]) -> Vec<String> {
+    names
+        .iter()
+        .filter(|n| !n.starts_with(SLOT_PREFIX) && !TEMPLATE_WORDS.contains(&n.as_str()))
+        .cloned()
+        .collect()
+}
+
+/// Gives every new word a spare slot of an existing table. Returns the
+/// new table, or the words that found no slot.
+pub fn assign_slots(
+    mut names: Vec<String>,
+    shapes: &[Shape],
+) -> std::result::Result<Vec<String>, Vec<String>> {
+    let mut wanted: Vec<String> = shapes.iter().flat_map(|s| s.words.clone()).collect();
+    wanted.sort();
+    wanted.dedup();
+    let mut missing = Vec::new();
+    for w in wanted {
+        if names.contains(&w) {
+            continue;
+        }
+        match names.iter().position(|n| n.starts_with(SLOT_PREFIX)) {
+            Some(i) => names[i] = w,
+            None => missing.push(w),
+        }
+    }
+    if missing.is_empty() {
+        Ok(names)
+    } else {
+        Err(missing)
+    }
+}
+
+/// The header of a sequence: the words, then the box.
+pub fn encode_prompt(v: &Vocab, text: &str, b: Box) -> (Vec<u32>, Vec<String>) {
     let unk = v.special("UNK").unwrap_or(14) as u32;
     let mut unknown = Vec::new();
     let mut toks = vec![v.special("BOS").unwrap_or(1) as u32];
     for w in words(text) {
-        // A number the trainer never produced becomes the nearest one
-        // it did: "300" reads as "304".
-        let w = match w.parse::<f64>() {
-            Ok(n) if v.name(&w).is_err() => snap_width(n).to_string(),
-            _ => w,
-        };
         match v.name(&w) {
             Ok(id) => toks.push(id as u32),
             Err(_) => {
@@ -250,68 +243,66 @@ pub fn encode_prompt(v: &Vocab, text: &str, advance: f64) -> (Vec<u32>, Vec<Stri
     }
     toks.push(v.special("SEP").unwrap_or(3) as u32);
     toks.push(v.special("ADV").unwrap_or(8) as u32);
-    toks.push(v.coord(advance) as u32);
+    for c in [b.x, b.y, b.w, b.h] {
+        toks.push(v.coord(c) as u32);
+    }
     (toks, unknown)
 }
 
-/// The shapes of one UFO, ready to sample.
+/// The shapes of one or more UFOs, ready to sample.
 pub struct Corpus {
     pub vocab: Vocab,
     pub shapes: Vec<Shape>,
 }
 
-impl Corpus {
-    pub fn from_ufo(path: &Path) -> Result<Self> {
-        let master = load_master(path)?;
-        let mut shapes: Vec<Shape> = master
-            .glyphs
-            .iter()
-            .filter_map(|(name, (_, ops))| Shape::new(name, ops))
-            .collect();
-        shapes.sort_by(|a, b| a.glyph.cmp(&b.glyph));
-        if shapes.is_empty() {
-            return Err(Error::Io {
-                path: path.to_path_buf(),
-                source: std::io::Error::other("no drawn glyph to learn a shape from"),
-            });
-        }
-        let vocab = Vocab::new(vocabulary(&shapes), Vec::new());
-        Ok(Self { vocab, shapes })
-    }
+/// Reads every drawn glyph of a UFO as a shape.
+pub fn load_shapes(path: &Path) -> Result<Vec<Shape>> {
+    let master = load_master(path)?;
+    let mut shapes: Vec<Shape> = master
+        .glyphs
+        .iter()
+        .filter_map(|(name, (_, ops))| Shape::new(name, ops))
+        .collect();
+    shapes.sort_by(|a, b| a.glyph.cmp(&b.glyph));
+    Ok(shapes)
+}
 
-    /// One training sequence: a shape at a random width and place,
-    /// with a sentence that says so.
+impl Corpus {
+    /// One training sequence: a shape in a random box, with a short
+    /// sentence that names it.
     pub fn sample(&self, rng: &mut Rng) -> Vec<u32> {
         let shape = &self.shapes[rng.below(self.shapes.len())];
-        let steps = ((WIDTH_MAX - WIDTH_MIN) / WIDTH_STEP) as usize + 1;
-        let width = WIDTH_MIN + WIDTH_STEP * rng.below(steps) as i32;
-        let w = f64::from(width);
-        let h = shape.height * w / shape.width;
-        let position = rng.below(POSITIONS.len());
-        let advance = f64::from(snap(
-            w + 2.0 * SIDEBEARING + f64::from(8 * rng.below(40) as i32),
-        ));
-        let (x, y) = place(position, w, h, advance);
-        let ops = shape.placed(w, x, y);
-
-        let template = TEMPLATES[rng.below(TEMPLATES.len())];
-        let phrases = POSITIONS[position].1;
-        let pos = phrases[rng.below(phrases.len())];
-        let text = template
-            .replace("{name}", &shape.words.join(" "))
-            .replace("{w}", &width.to_string())
-            .replace("{pos}", pos);
-        let (mut toks, _) = encode_prompt(&self.vocab, &text, advance);
+        let steps = ((WIDTH_MAX - WIDTH_MIN) / 8) as usize + 1;
+        let w = f64::from(WIDTH_MIN + 8 * rng.below(steps) as i32);
+        // The drawn aspect, stretched a little either way, so a wide
+        // box gives a wide shape rather than a surprise.
+        let stretch = 0.8 + 0.45 * rng.f64();
+        let h = (w * shape.height / shape.width * stretch).clamp(16.0, 980.0);
+        let x = -100.0 + rng.f64() * (1100.0 - w);
+        let y = -200.0 + rng.f64() * (1000.0 - h);
+        let b = Box {
+            x: f64::from(snap(x)),
+            y: f64::from(snap(y)),
+            w: f64::from(snap(w)),
+            h: f64::from(snap(h)),
+        };
+        let ops = shape.placed(b);
+        let name = shape.words.join(" ");
+        let text = match rng.below(5) {
+            0 => format!("a {name}"),
+            1 => format!("draw a {name}"),
+            _ => name,
+        };
+        let (mut toks, _) = encode_prompt(&self.vocab, &text, b);
         toks.extend(self.vocab.encode_ops(&ops).into_iter().map(|t| t as u32));
         toks.push(self.vocab.special("EOS").unwrap_or(2) as u32);
         toks
     }
 }
 
-/// Next-token cross entropy over the drawing only. The sentence and
-/// the advance are given at run time, so predicting them is wasted
-/// capacity: every target up to and including the advance coordinate
-/// is masked, along with padding.
+/// Next-token cross entropy over the drawing only. The words and the
+/// box are given at run time, so predicting them is wasted capacity:
+/// every target up to the last box coordinate is masked, with padding.
 fn drawing_loss(
     model: &OutlineModel,
     seqs: &[Vec<u32>],
@@ -320,22 +311,19 @@ fn drawing_loss(
     max_len: usize,
     device: &candle_core::Device,
     train: bool,
-) -> Result<candle_core::Tensor> {
-    use candle_core::{Tensor, D};
+) -> Result<Tensor> {
     let batch = pad_batch(seqs, pad, max_len, device)?;
     let (b, l) = batch.dims2()?;
-    // Targets with the header blanked to pad, so the pad mask drops them.
-    let width = l;
-    let mut flat = Vec::with_capacity(b * width);
+    let mut flat = Vec::with_capacity(b * l);
     for s in seqs {
-        let n = s.len().min(width);
-        let header_end = s.iter().position(|t| *t == adv).map_or(0, |i| i + 2);
+        let n = s.len().min(l);
+        let header_end = s.iter().position(|t| *t == adv).map_or(0, |i| i + 5);
         for (i, t) in s[..n].iter().enumerate() {
             flat.push(if i < header_end { pad } else { *t });
         }
-        flat.extend(std::iter::repeat_n(pad, width - n));
+        flat.extend(std::iter::repeat_n(pad, l - n));
     }
-    let masked = Tensor::from_vec(flat, (b, width), device)?;
+    let masked = Tensor::from_vec(flat, (b, l), device)?;
     let inputs = batch.narrow(1, 0, l - 1)?;
     let targets = masked.narrow(1, 1, l - 1)?;
     let logits = model.forward_batch(&inputs, train)?;
@@ -350,15 +338,78 @@ fn drawing_loss(
     Ok((loss / count)?)
 }
 
-/// Trains a draw model on the shapes in `source` and writes it to `out`.
+/// What a training run is told beyond the shared config.
+#[derive(Debug, Clone, Default)]
+pub struct DrawOptions {
+    /// Continue from this model: keep its words, give new words its
+    /// spare slots, start from its weights.
+    pub init: Option<PathBuf>,
+    /// Spare slots for a fresh base.
+    pub spare: usize,
+    /// Words to draw at every checkpoint, printed as `sample` lines.
+    pub sample_words: Vec<String>,
+}
+
+/// The box sample drawings use: a square in the middle of a glyph.
+pub const SAMPLE_BOX: Box = Box {
+    x: 150.0,
+    y: 100.0,
+    w: 400.0,
+    h: 400.0,
+};
+
+/// Drawing commands as SVG path data, for a sample line or a proof.
+pub fn svg_path(ops: &[Op]) -> String {
+    let mut d = String::new();
+    for op in ops {
+        match op {
+            Op::MoveTo(x, y) => d.push_str(&format!("M{x} {y} ")),
+            Op::LineTo(x, y) => d.push_str(&format!("L{x} {y} ")),
+            Op::CurveTo(p) => d.push_str(&format!(
+                "C{} {} {} {} {} {} ",
+                p[0].0, p[0].1, p[1].0, p[1].1, p[2].0, p[2].1
+            )),
+            Op::ClosePath => d.push_str("Z "),
+        }
+    }
+    d.trim_end().to_string()
+}
+
+/// Trains a draw model on the shapes in `sources` and writes it to
+/// `out`. With `init`, the run continues from that model and new words
+/// take its spare slots.
 pub fn train_draw(
-    source: &Path,
+    sources: &[PathBuf],
     out: &Path,
     cfg: &TrainConfig,
+    opts: &DrawOptions,
     progress: &mut dyn FnMut(usize, usize, &str),
 ) -> Result<Report> {
     let started = Instant::now();
-    let corpus = Corpus::from_ufo(source)?;
+    let mut shapes = Vec::new();
+    for s in sources {
+        shapes.extend(load_shapes(s)?);
+    }
+    if shapes.is_empty() {
+        return Err(Error::Io {
+            path: sources.first().cloned().unwrap_or_default(),
+            source: std::io::Error::other("no drawn glyph to learn a shape from"),
+        });
+    }
+
+    let init_ckpt = opts.init.as_deref().map(Checkpoint::open).transpose()?;
+    let names = match &init_ckpt {
+        Some(c) => assign_slots(c.glyph_names.clone(), &shapes).map_err(|missing| Error::Io {
+            path: out.to_path_buf(),
+            source: std::io::Error::other(format!(
+                "the base has no spare slot left for: {}. Train a base with more --spare.",
+                missing.join(", ")
+            )),
+        })?,
+        None => vocabulary(&shapes, opts.spare),
+    };
+    let vocab = Vocab::new(names, Vec::new());
+    let corpus = Corpus { vocab, shapes };
     let vocab_size = corpus.vocab.len();
     let pad = corpus.vocab.special("PAD").unwrap_or(0) as u32;
     let adv = corpus.vocab.special("ADV").unwrap_or(8) as u32;
@@ -367,25 +418,26 @@ pub fn train_draw(
     let val: Vec<Vec<u32>> = (0..VAL_SEQUENCES)
         .map(|_| corpus.sample(&mut val_rng))
         .collect();
-    let longest = {
-        let mut probe = Rng::new(cfg.seed.wrapping_add(3));
-        (0..256)
-            .map(|_| corpus.sample(&mut probe).len())
-            .max()
-            .unwrap_or(64)
-    };
-    let max_len = if cfg.max_len > 0 {
-        cfg.max_len
-    } else {
-        (longest + longest / 4).max(256)
+    let max_len = match (&init_ckpt, cfg.max_len) {
+        (Some(c), _) => c.config.max_len,
+        (None, 0) => {
+            let mut probe = Rng::new(cfg.seed.wrapping_add(3));
+            let longest = (0..256)
+                .map(|_| corpus.sample(&mut probe).len())
+                .max()
+                .unwrap_or(64);
+            (longest + longest / 4).max(256)
+        }
+        (None, n) => n,
     };
     let mut extra = serde_json::Map::new();
     extra.insert("task".into(), serde_json::Value::String("draw".into()));
+    extra.insert("format".into(), serde_json::Value::String("box".into()));
     let model_cfg = ModelConfig {
         kind: ModelKind::Outline,
-        dims: cfg.dims,
-        layers: cfg.layers,
-        heads: cfg.heads,
+        dims: init_ckpt.as_ref().map_or(cfg.dims, |c| c.config.dims),
+        layers: init_ckpt.as_ref().map_or(cfg.layers, |c| c.config.layers),
+        heads: init_ckpt.as_ref().map_or(cfg.heads, |c| c.config.heads),
         vocab_size,
         max_len,
         delta_center: None,
@@ -400,7 +452,7 @@ pub fn train_draw(
     let device = crate::device::pick(choice)?;
     let device_name = crate::device::name(&device);
     eprintln!("device {device_name}");
-    let varmap = VarMap::new();
+    let mut varmap = VarMap::new();
     let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
     let model = OutlineModel::build(
         vb,
@@ -409,6 +461,9 @@ pub fn train_draw(
         device.clone(),
         cfg.dropout,
     )?;
+    if let Some(c) = &init_ckpt {
+        varmap.load(c.weights_path())?;
+    }
     let params: usize = varmap.all_vars().iter().map(|v| v.elem_count()).sum();
 
     std::fs::create_dir_all(out).map_err(|source| Error::Io {
@@ -445,7 +500,14 @@ pub fn train_draw(
             total / count as f64
         })
     };
-    let checkpoint = |model: &OutlineModel, tag: &str, best: &mut f64| -> Result<()> {
+    let samples = |model: &OutlineModel, step: usize| -> Result<()> {
+        for w in &opts.sample_words {
+            let drawn = draw(model, w, SAMPLE_BOX, max_len)?;
+            eprintln!("sample {step} {w} {}", svg_path(&drawn.ops));
+        }
+        Ok(())
+    };
+    let checkpoint = |model: &OutlineModel, tag: &str, step: usize, best: &mut f64| -> Result<()> {
         let v = val_loss(model)?;
         let mut note = format!("checkpoint {tag}: val loss {v:.4}");
         if v < *best {
@@ -454,9 +516,12 @@ pub fn train_draw(
             note.push_str(" (best, saved)");
         }
         eprintln!("{note}");
-        Ok(())
+        samples(model, step)
     };
 
+    if init_ckpt.is_some() {
+        checkpoint(&model, "start", 0, &mut best_val)?;
+    }
     for step in 1..=cfg.steps {
         let seqs: Vec<Vec<u32>> = (0..cfg.batch).map(|_| corpus.sample(&mut rng)).collect();
         let loss = drawing_loss(&model, &seqs, pad, adv, max_len, &device, true)?;
@@ -475,14 +540,14 @@ pub fn train_draw(
             progress(step, cfg.steps, &format!("loss {value:.4}"));
         }
         if step % cfg.ckpt_every == 0 {
-            checkpoint(&model, &format!("step {step}"), &mut best_val)?;
+            checkpoint(&model, &format!("step {step}"), step, &mut best_val)?;
         }
         if deadline.is_some_and(|limit| started.elapsed().as_secs_f64() > limit) {
             eprintln!("time budget reached at step {step}");
             break;
         }
     }
-    checkpoint(&model, "final", &mut best_val)?;
+    checkpoint(&model, "final", steps_done, &mut best_val)?;
 
     let report = Report {
         out: out.to_path_buf(),
@@ -503,21 +568,30 @@ pub fn train_draw(
         .and_then(|n| n.to_str())
         .unwrap_or("model")
         .to_string();
-    let shapes: Vec<String> = corpus.shapes.iter().map(|s| s.words.join(" ")).collect();
+    let known = known_words(corpus.vocab.glyph_names());
+    let spare = corpus
+        .vocab
+        .glyph_names()
+        .iter()
+        .filter(|n| n.starts_with(SLOT_PREFIX))
+        .count();
     write_json(
         &out.join("manifest.json"),
         &serde_json::json!({
             "name": name,
             "task": "draw",
+            "format": "box",
             "kind": "model",
             "trained": today(),
-            "source": source,
+            "sources": sources,
+            "init": opts.init,
             "steps": steps_done,
             "best_val_loss": best_val,
             "params": params,
             "seconds": report.seconds,
             "device": device_name,
-            "shapes": shapes,
+            "words": known,
+            "spare": spare,
             "notes": "Trained by font-ml train-draw. Validation loss picked the checkpoint.",
         }),
     )?;
@@ -537,11 +611,17 @@ pub struct Drawn {
     pub ended: bool,
 }
 
-/// Draws what `prompt` asks for, in a box `advance` wide.
-pub fn draw(model: &OutlineModel, prompt: &str, advance: f64, max_len: usize) -> Result<Drawn> {
+/// Draws what `prompt` names, filling `b`.
+pub fn draw(model: &OutlineModel, prompt: &str, b: Box, max_len: usize) -> Result<Drawn> {
     let v = model.vocab();
     let eos = v.special("EOS").unwrap_or(2) as u32;
-    let (mut ids, unknown) = encode_prompt(v, prompt, advance);
+    let b = Box {
+        x: b.x.clamp(f64::from(COORD_MIN), f64::from(COORD_MAX)),
+        y: b.y.clamp(f64::from(COORD_MIN), f64::from(COORD_MAX)),
+        w: b.w.clamp(2.0, f64::from(COORD_MAX)),
+        h: b.h.clamp(2.0, f64::from(COORD_MAX)),
+    };
+    let (mut ids, unknown) = encode_prompt(v, prompt, b);
     let header = ids.len();
     let mut ended = false;
     while ids.len() < max_len {
@@ -612,79 +692,12 @@ pub fn ops_to_contours(ops: &[Op]) -> Vec<norad::Contour> {
     out
 }
 
-/// The grid every coordinate lands on, for callers that report it.
-pub const fn grid() -> i32 {
-    GRID
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn words_are_lower_case_letters_and_digits() {
-        assert_eq!(
-            words("Draw a Circle, 64 units wide!"),
-            vec!["draw", "a", "circle", "64", "units", "wide"]
-        );
-    }
-
-    #[test]
-    fn a_glyph_name_gives_its_shape_words() {
-        assert_eq!(shape_words("circle.300"), vec!["circle"]);
-        assert_eq!(shape_words("five-star"), vec!["five", "star"]);
-    }
-
-    #[test]
-    fn a_square_round_trips_through_contours() {
-        let ops = vec![
-            Op::MoveTo(0.0, 0.0),
-            Op::LineTo(10.0, 0.0),
-            Op::LineTo(10.0, 10.0),
-            Op::LineTo(0.0, 10.0),
-            Op::LineTo(0.0, 0.0),
-            Op::ClosePath,
-        ];
-        let contours = ops_to_contours(&ops);
-        assert_eq!(contours.len(), 1);
-        assert_eq!(contours[0].points.len(), 4);
-        assert_eq!(contours[0].points[0].typ, norad::PointType::Line);
-    }
-
-    #[test]
-    fn the_vocabulary_holds_every_width_and_template_word() {
-        let shape = Shape::new(
-            "circle",
-            &[
-                Op::MoveTo(0.0, 0.0),
-                Op::LineTo(10.0, 0.0),
-                Op::LineTo(10.0, 10.0),
-                Op::ClosePath,
-            ],
-        )
-        .unwrap();
-        let v = vocabulary(&[shape]);
-        assert!(v.contains(&"circle".to_string()));
-        assert!(v.contains(&"64".to_string()));
-        assert!(v.contains(&"lower".to_string()));
-        assert!(!v.contains(&"name".to_string()));
-    }
-
-    #[test]
-    fn placement_covers_the_box() {
-        assert_eq!(place(0, 100.0, 100.0, 400.0), (60.0, 0.0));
-        assert_eq!(place(4, 100.0, 100.0, 400.0), (150.0, 300.0));
-        assert_eq!(place(8, 100.0, 100.0, 400.0), (240.0, 600.0));
-    }
-}
-
-#[cfg(test)]
-mod sample_tests {
-    use super::*;
-
-    #[test]
-    fn a_sample_reads_back_as_words_then_an_outline() {
-        let square = Shape::new(
+    fn square() -> Shape {
+        Shape::new(
             "square",
             &[
                 Op::MoveTo(0.0, 0.0),
@@ -695,9 +708,74 @@ mod sample_tests {
                 Op::ClosePath,
             ],
         )
-        .unwrap();
-        let shapes = vec![square];
-        let vocab = Vocab::new(vocabulary(&shapes), Vec::new());
+        .unwrap()
+    }
+
+    #[test]
+    fn words_are_lower_case_letters_and_digits() {
+        assert_eq!(
+            words("Draw a Circle, 64 units wide!"),
+            vec!["draw", "a", "circle", "64", "units", "wide"]
+        );
+        // A slot's name keeps its prefix, which no typed word has.
+        assert_eq!(words("~3"), vec!["3"]);
+    }
+
+    #[test]
+    fn a_glyph_name_gives_its_shape_words() {
+        assert_eq!(shape_words("circle.300"), vec!["circle"]);
+        assert_eq!(shape_words("five-star"), vec!["five", "star"]);
+    }
+
+    #[test]
+    fn a_square_round_trips_through_contours() {
+        let ops = square().placed(Box {
+            x: 10.0,
+            y: 10.0,
+            w: 50.0,
+            h: 50.0,
+        });
+        let contours = ops_to_contours(&ops);
+        assert_eq!(contours.len(), 1);
+        assert_eq!(contours[0].points.len(), 4);
+        assert_eq!(contours[0].points[0].typ, norad::PointType::Line);
+        assert_eq!(
+            (contours[0].points[2].x, contours[0].points[2].y),
+            (60.0, 60.0)
+        );
+    }
+
+    #[test]
+    fn a_fresh_vocabulary_has_templates_words_and_slots() {
+        let v = vocabulary(&[square()], 4);
+        assert_eq!(&v[..5], TEMPLATE_WORDS);
+        assert!(v.contains(&"square".to_string()));
+        assert_eq!(v.iter().filter(|n| n.starts_with(SLOT_PREFIX)).count(), 4);
+        assert_eq!(known_words(&v), vec!["square"]);
+    }
+
+    #[test]
+    fn a_new_word_takes_a_slot_and_nothing_else_moves() {
+        let base = vocabulary(&[square()], 2);
+        let heart = Shape::new("heart", &square().ops).unwrap();
+        let next = assign_slots(base.clone(), &[square(), heart]).unwrap();
+        assert_eq!(next.len(), base.len());
+        let slot = base.iter().position(|n| n == "~0").unwrap();
+        assert_eq!(next[slot], "heart");
+        assert!(next.iter().zip(&base).filter(|(a, b)| a != b).count() == 1);
+        let star = Shape::new("star", &square().ops).unwrap();
+        let moon = Shape::new("moon", &square().ops).unwrap();
+        let ring = Shape::new("ring", &square().ops).unwrap();
+        assert_eq!(
+            assign_slots(base, &[star, moon, ring]).unwrap_err(),
+            vec!["star"]
+        );
+    }
+
+    #[test]
+    fn a_sample_is_words_then_box_then_outline() {
+        let shapes = vec![square()];
+        let vocab = Vocab::new(vocabulary(&shapes, 1), Vec::new());
         let corpus = Corpus { vocab, shapes };
         let mut rng = Rng::new(5);
         let seq = corpus.sample(&mut rng);
@@ -705,15 +783,21 @@ mod sample_tests {
             .iter()
             .map(|t| corpus.vocab.token(*t as usize).unwrap_or("?"))
             .collect();
-        eprintln!("{}", text.join(" "));
         assert_eq!(text[0], "BOS");
-        assert!(text.contains(&"SEP"));
-        assert!(text.contains(&"MOVE"));
-        assert_eq!(*text.last().unwrap(), "EOS");
-        // The outline is a square: four lines back to the start.
         let sep = text.iter().position(|t| *t == "SEP").unwrap();
+        assert_eq!(text[sep + 1], "ADV");
+        assert!(text[sep + 2..sep + 6].iter().all(|t| t.starts_with('C')));
+        assert_eq!(text[sep + 6], "MOVE");
+        assert_eq!(*text.last().unwrap(), "EOS");
         let body: Vec<usize> = seq[sep..].iter().map(|t| *t as usize).collect();
-        let ops = corpus.vocab.decode_ops(&body);
-        assert_eq!(ops.len(), 6, "{ops:?}");
+        assert_eq!(corpus.vocab.decode_ops(&body).len(), 6);
+    }
+
+    #[test]
+    fn a_box_parses_four_numbers() {
+        let b = Box::parse("10, 20, 300, 400").unwrap();
+        assert_eq!((b.x, b.y, b.w, b.h), (10.0, 20.0, 300.0, 400.0));
+        assert!(Box::parse("1,2,3").is_err());
+        assert!(Box::parse("1,2,0,4").is_err());
     }
 }

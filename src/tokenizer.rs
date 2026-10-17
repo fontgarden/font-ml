@@ -61,10 +61,12 @@ pub struct Vocab {
 
 impl Vocab {
     /// Build the table from the glyph names and Unicode values a
-    /// `vocab.txt` carries. Both must already be sorted the way the
-    /// lab sorts them, which `Checkpoint::open` preserves.
-    pub fn new(mut glyph_names: Vec<String>, mut unicodes: Vec<u32>) -> Self {
-        glyph_names.sort();
+    /// `vocab.txt` carries, in the order the file gives them.
+    pub fn new(glyph_names: Vec<String>, mut unicodes: Vec<u32>) -> Self {
+        // Names keep the order they were given. A bolden corpus passes
+        // them sorted; a draw model's vocab.txt is written in the order
+        // its words were assigned, so a spare slot can be renamed to a
+        // new word without moving every token after it.
         unicodes.sort_unstable();
         unicodes.dedup();
 
@@ -134,9 +136,10 @@ impl Vocab {
     /// Id of a glyph-name token.
     pub fn name(&self, glyph: &str) -> Result<usize> {
         self.glyph_names
-            .binary_search(&glyph.to_string())
+            .iter()
+            .position(|n| n == glyph)
             .map(|i| SPECIALS.len() + i)
-            .map_err(|_| Error::UnknownGlyph(glyph.to_string()))
+            .ok_or_else(|| Error::UnknownGlyph(glyph.to_string()))
     }
 
     /// Id of a coordinate, snapped to the grid.
